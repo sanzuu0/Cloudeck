@@ -3,11 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'  # триггер на git tag вида v0.1.0, v0.0.1-test и т.п.
+      - 'v*'
 
 permissions:
-  contents: write   # для создания GitHub Release
-  packages: write   # для пуша Docker-образов в GHCR
+  contents: write     # для action-gh-release
+  packages: write     # чтобы пушить в GHCR
 
 jobs:
   release:
@@ -22,14 +22,20 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: 🔨 Build & Push Docker image
+      - name: 🔑 Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔨 Build & push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: test/Dockerfile.hello
           push: true
           tags: ghcr.io/${{ github.repository_owner }}/cloudeck:${{ github.ref_name }}
-
 
       - name: 📦 Create GitHub Release
         uses: softprops/action-gh-release@v2
