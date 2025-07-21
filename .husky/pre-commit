@@ -1,0 +1,5 @@
+#!/usr/bin/env sh
+if [ -f go.mod ]; then
+  go vet ./... || exit 1
+  golangci-lint run || exit 1
+fi
