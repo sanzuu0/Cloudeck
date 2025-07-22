@@ -1,0 +1,21 @@
+{
+  "name": "cloudeck",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "prepare": "husky install"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.8.1",
+    "@commitlint/config-conventional": "^19.8.1",
+    "husky": "^9.1.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sanzuu0/Cloudeck.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sanzuu0/Cloudeck/issues"
+  },
+  "homepage": "https://github.com/sanzuu0/Cloudeck#readme"
+}
