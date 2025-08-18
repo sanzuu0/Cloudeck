@@ -1,0 +1,86 @@
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- IDE ---
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/
+.ionide/
+
+# --- Logs / temp ---
+*.log
+logs/
+tmp/
+.cache/
+
+# --- Env & secrets ---
+.env
+.env.*
+!*.example
+*.pem
+*.key
+*.crt
+*.p12
+*.der
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+.pyre/
+.pytype/
+dmypy.json
+.dmypy.json
+.pdm.toml
+poetry.toml
+
+# --- Go ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+/bin/
+/out/
+/build/
+coverage.out
+
+# --- Docker (локальные данные/оверрайды; базовые файлы оставляем) ---
+docker/volumes/
+docker/data/
+docker/logs/
+docker/*.local.yml
+docker-compose.override.yml
+docker-compose.*.local.yml
+docker-compose.*.dev.yml
+docker-compose.*.test.yml
+!docker-compose.yml
+
+# --- Build артефакты общего вида ---
+dist/

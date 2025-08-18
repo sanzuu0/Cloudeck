@@ -1,0 +1,24 @@
+text=auto
+eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+
+*.sh text eol=lf
+*.bash text eol=lf
+*.env text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+docs/**          linguist-documentation
+.github/         export-ignore
+
+CHANGELOG*       merge=union
