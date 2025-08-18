@@ -1,0 +1,29 @@
+# cloudeck — CODEOWNERS
+
+/.github/                 @sanzuu0
+/.github/CODEOWNERS       @sanzuu0
+
+*                         @sanzuu0
+
+/services/                @sanzuu0
+/web/                     @sanzuu0
+/ml/                      @sanzuu0
+/charts/                  @sanzuu0
+/docs/                    @sanzuu0
+/perf/                    @sanzuu0
+
+/api/                     @sanzuu0
+/proto/                   @sanzuu0
+
+/deploy/                  @sanzuu0
+/scripts/                 @sanzuu0
+
+*.go                      @sanzuu0
+*.ts                      @sanzuu0
+*.tsx                     @sanzuu0
+*.js                      @sanzuu0
+*.py                      @sanzuu0
+*.md                      @sanzuu0
+**/Dockerfile*            @sanzuu0
+*.yaml                    @sanzuu0
+*.yml                     @sanzuu0
