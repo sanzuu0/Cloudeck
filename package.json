@@ -1,0 +1,13 @@
+{
+  "name": "@cloudeck/repo",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.0.0",
+    "@commitlint/cli": "^19.0.0",
+    "@commitlint/config-conventional": "^19.0.0"
+  }
+}
