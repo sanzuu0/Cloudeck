@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# commit-msg: Conventional Commits via commitlint
+# shellcheck disable=SC1091
+[ -f "$(dirname -- "$0")/_/husky.sh" ] && . "$(dirname -- "$0")/_/husky.sh"
+set -euo pipefail
+
+if command -v npx >/dev/null 2>&1; then
+  npx --yes @commitlint/cli --edit "$1"
+else
+  echo "ℹ️ npx not found → skipping commit message lint."
+fi

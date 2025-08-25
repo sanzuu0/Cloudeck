@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+# Husky pre-push hook for a Go + Frontend monorepo
+# Skips on docs-only, checks selectively by changed areas.
+# Bypass if needed: `git push --no-verify` or `HUSKY=0 git push`
+# Allow pushing to main once: `ALLOW_MAIN_PUSH=1 git push`
+
+# shellcheck disable=SC1091
+[ -f "$(dirname -- "$0")/_/husky.sh" ] && . "$(dirname -- "$0")/_/husky.sh"
+
+set -euo pipefail
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+# Collect refs from stdin (local_ref local_sha remote_ref remote_sha)
+declare -a pushed_lines=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+  pushed_lines+=("$local_ref $local_sha $remote_ref $remote_sha")
+done
+
+# 1) Block direct pushes to main unless explicitly allowed
+for line in "${pushed_lines[@]}"; do
+  read -r _local_ref _local_sha _remote_ref _remote_sha <<<"$line"
+  if [[ "${_remote_ref:-}" == "refs/heads/main" && "${ALLOW_MAIN_PUSH:-0}" != "1" ]]; then
+    echo "❌ Direct push to 'main' is blocked. Open a PR instead. (set ALLOW_MAIN_PUSH=1 to override once)"
+    exit 1
+  fi
+done
+
+# 2) Figure out diff base ↔ head (use tracked upstream if exists; else empty tree)
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if git rev-parse --verify --quiet "origin/$branch" >/dev/null; then
+  base="origin/$branch"
+else
+  base="$(git hash-object -t tree /dev/null)"
+fi
+head="HEAD"
+
+# Changed files (added/copied/modified/renamed)
+CHANGED="$(git diff --name-only --diff-filter=ACMR "$base"...$head || true)"
+if [ -z "$CHANGED" ]; then
+  echo "🟢 Nothing changed to validate."
+  exit 0
+fi
+
+# 3) Classify changes
+only_docs=true
+ci_changed=false
+go_changed=false
+frontend_changed=false
+docker_changed=false
+migrations_changed=false
+contracts_changed=false
+
+while IFS= read -r f; do
+  # docs/meta
+  if [[ "$f" =~ (^docs/|\.md$|^LICENSE$|^SECURITY\.md$|^CONTRIBUTING\.md$|^CODEOWNERS$|^\.github/pull_request_template\.md$|^README\.md$) ]]; then
+    :
+  else
+    only_docs=false
+  fi
+  [[ "$f" =~ ^\.github/workflows/ ]] && ci_changed=true
+  [[ "$f" =~ \.go$|^go\.mod$|^go\.sum$|^services/|^internal/|^cmd/|^libs/ ]] && go_changed=true
+  [[ "$f" =~ (^apps/|^web/|^frontend/|package\.json$|pnpm-lock\.yaml$|yarn\.lock$|package-lock\.json$|tsconfig\.json$) ]] && frontend_changed=true
+  [[ "$f" =~ (^|/)Dockerfile|^Dockerfile\.svc$|^docker-compose.*\.ya?ml$ ]] && docker_changed=true
+  [[ "$f" =~ ^migrations/ ]] && migrations_changed=true
+  [[ "$f" =~ (^idl/|\.proto$|openapi\.ya?ml$|openapi\.json$) ]] && contracts_changed=true
+done <<< "$CHANGED"
+
+# 4) Docs-only → skip fast
+if $only_docs; then
+  echo "📝 Docs/metadata-only changes → skipping checks."
+  exit 0
+fi
+
+# 5) Quick secret scan on the pushed range (if available)
+if command -v gitleaks >/dev/null 2>&1; then
+  echo "🔍 gitleaks (range $base..$head)…"
+  # --log-opts делает скан только коммитов в указанном диапазоне
+  gitleaks detect --no-banner --log-opts "$base..$head" || {
+    echo "❌ Secrets detected by gitleaks. Please fix (or add allowlist where appropriate)."
+    exit 1
+  }
+else
+  echo "ℹ️ gitleaks not found → skipping secret scan."
+fi
+
+# 6) Warn on very large newly added/modified files (outside Git LFS)
+MAX_FILE_MB="${MAX_FILE_MB:-10}"
+LARGE=()
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  # size in MB (integer)
+  size_bytes=$(wc -c < "$f" 2>/dev/null || echo 0)
+  size_mb=$(( (size_bytes + 1024*1024 - 1) / (1024*1024) ))
+  if [ "$size_mb" -ge "$MAX_FILE_MB" ]; then
+    LARGE+=("$f (${size_mb}MB)")
+  fi
+done <<< "$CHANGED"
+if [ "${#LARGE[@]}" -gt 0 ]; then
+  echo "⚠️  Large files detected (>${MAX_FILE_MB}MB):"
+  printf '   - %s\n' "${LARGE[@]}"
+  echo "    Consider Git LFS or shrinking them."
+fi
+
+# 7) CI/workflow YAML lint
+if $ci_changed; then
+  if command -v actionlint >/dev/null 2>&1; then
+    echo "🧪 actionlint .github/workflows …"
+    actionlint
+  elif command -v yamllint >/dev/null 2>&1; then
+    echo "🧪 yamllint .github/workflows …"
+    yamllint -s .github/workflows || true
+  else
+    echo "ℹ️ actionlint/yamllint not found → skipping workflow lint."
+  fi
+fi
+
+# 8) Go smoke checks (vet + build for changed packages)
+if $go_changed; then
+  if command -v go >/dev/null 2>&1; then
+    echo "🐹 Go: collecting changed packages…"
+    # Get dirs with changed .go files, then resolve to packages
+    mapfile -t go_dirs < <(git diff --name-only "$base"...$head | grep -E '\.go$' | xargs -r -n1 dirname | sort -u)
+    if [ "${#go_dirs[@]}" -eq 0 ]; then
+      # go files not directly changed but maybe go.mod updated; run a quick vet/build on all to be safe
+      go_dirs=(./...)
+    fi
+    # Resolve to import paths (fallback to ./... if resolution fails)
+    set +e
+    mapfile -t go_pkgs < <(go list "${go_dirs[@]}" 2>/dev/null)
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ] || [ "${#go_pkgs[@]}" -eq 0 ]; then
+      go_pkgs=(./...)
+    fi
+    echo "🐹 go vet ${#go_pkgs[@]} pkg(s)…"
+    go vet "${go_pkgs[@]}"
+    echo "🐹 go build (type-check) ${#go_pkgs[@]} pkg(s)…"
+    CGO_ENABLED=0 go build "${go_pkgs[@]}"
+    # Optional hint if go.mod changed
+    if git diff --name-only "$base"...$head | grep -qE '^go\.mod$|^go\.sum$'; then
+      echo "ℹ️ go.mod/sum changed. If CI fails, try 'go mod tidy' locally and commit."
+    fi
+  else
+    echo "ℹ️ 'go' tool not found → skipping Go checks."
+  fi
+fi
+
+# 9) Frontend checks (lint + typecheck) for changed workspaces
+if $frontend_changed; then
+  echo "🌐 Frontend: lint/typecheck…"
+  # Determine candidate roots: repo root + top-level app dirs touched
+  declare -a roots=()
+  roots+=(".") # allow root workspace
+  # add top-level dirs of changed frontend files
+  mapfile -t fdirs < <(echo "$CHANGED" | grep -E '^(apps/|web/|frontend/)' | awk -F/ '{print $1"/"$2}' | sort -u)
+  roots+=("${fdirs[@]}")
+  # de-duplicate
+  declare -A seen=()
+  for dir in "${roots[@]}"; do
+    [ -d "$dir" ] || continue
+    [ -f "$dir/package.json" ] || continue
+    key="$(cd "$dir" && pwd)"
+    if [ -n "${seen[$key]+x}" ]; then continue; fi
+    seen[$key]=1
+    echo "  • $dir"
+    if [ -f "$dir/pnpm-lock.yaml" ] && command -v pnpm >/dev/null 2>&1; then
+      (cd "$dir" && pnpm -s lint || true)
+    elif [ -f "$dir/yarn.lock" ] && command -v yarn >/dev/null 2>&1; then
+      (cd "$dir" && yarn -s lint || true)
+    elif command -v npm >/dev/null 2>&1; then
+      (cd "$dir" && npm run -s lint --if-present || true)
+    else
+      echo "   ↳ No Node package manager found → skipping lint in $dir"
+    fi
+    # TypeScript typecheck if tsconfig exists
+    if [ -f "$dir/tsconfig.json" ]; then
+      if command -v pnpm >/dev/null 2>&1; then
+        (cd "$dir" && pnpm -s dlx tsc --noEmit) || true
+      elif command -v npx >/dev/null 2>&1; then
+        (cd "$dir" && npx --yes tsc --noEmit) || true
+      else
+        echo "   ↳ No npx/pnpm to run tsc → skipping typecheck in $dir"
+      fi
+    fi
+  done
+fi
+
+# 10) Dockerfile lint
+if $docker_changed; then
+  if command -v hadolint >/dev/null 2>&1; then
+    echo "🐳 hadolint Dockerfiles…"
+    echo "$CHANGED" | grep -E '(^|/)Dockerfile|^Dockerfile\.svc$' | xargs -r hadolint
+  else
+    echo "ℹ️ hadolint not found → skipping Dockerfile lint."
+  fi
+fi
+
+# 11) Optional: light checks for migrations/contracts (non-blocking hints)
+if $migrations_changed; then
+  echo "ℹ️ Migrations changed — ensure you added matching *.down.sql and proper timestamp prefixes."
+fi
+if $contracts_changed; then
+  echo "ℹ️ Contracts changed — consider running 'spectral lint' (OpenAPI) or 'buf lint' (Protobuf) locally."
+fi
+
+echo "✅ pre-push OK"
