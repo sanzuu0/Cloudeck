@@ -1,0 +1,317 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Cancel stale runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.ref || github.ref }}
+  cancel-in-progress: true
+
+# Minimal permissions for PR CI (can be extended later if needed)
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.22.x'   # bump when you move
+  NODE_VERSION: '20.x'
+
+jobs:
+  # 0) Routing — detect what changed and build flags/matrices
+  changes:
+    name: Changes · routing
+    runs-on: ubuntu-latest
+    outputs:
+      only_docs: ${{ steps.flags.outputs.only_docs }}
+      go_exists: ${{ steps.flags.outputs.go_exists }}
+      go_changed: ${{ steps.flags.outputs.go_changed }}
+      frontend_exists: ${{ steps.flags.outputs.frontend_exists }}
+      frontend_changed: ${{ steps.flags.outputs.frontend_changed }}
+      contracts_changed: ${{ steps.flags.outputs.contracts_changed }}
+      infra_changed: ${{ steps.flags.outputs.infra_changed }}
+      integration_changed: ${{ steps.flags.outputs.integration_changed }}
+      e2e_changed: ${{ steps.flags.outputs.e2e_changed }}
+      services_matrix: ${{ steps.svcs.outputs.matrix }}
+      services_any: ${{ steps.svcs.outputs.any }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for diffs against base
+
+      # Path filters: docs / go / frontend / docker / contracts / infra / integration / e2e
+      - id: pf
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            docs:
+              - 'docs/**'
+              - '**/*.md'
+            go:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'libs/**'
+              - 'services/**'
+            frontend:
+              - 'apps/**'
+              - 'web/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'yarn.lock'
+              - 'package-lock.json'
+            docker:
+              - 'services/*/Dockerfile'
+            contracts:
+              - 'idl/**'
+              - '**/*.proto'
+              - '**/*.graphql'
+              - '**/openapi.yaml'
+              - '**/openapi.yml'
+              - '**/openapi.json'
+              - '**/api/**'
+            infra:
+              - 'k8s/**'
+              - 'helm/**'
+              - 'infra/**'
+              - 'terraform/**'
+            integration:
+              - 'docker-compose.test.yml'
+              - 'tests/integration/**'
+              - '**/migrations/**'
+            e2e:
+              - 'tests/e2e/**'
+              - 'apps/**'
+
+      # Compute presence flags and "only_docs"
+      - id: flags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Does repo contain Go or Frontend at all
+          if [ -f "go.mod" ] || [ -n "$(git ls-files '*.go')" ]; then go_exists=true; else go_exists=false; fi
+          if [ -f "package.json" ] || [ -d "apps" ] || [ -d "web" ]; then frontend_exists=true; else frontend_exists=false; fi
+
+          go_changed="${{ steps.pf.outputs.go }}"
+          frontend_changed="${{ steps.pf.outputs.frontend }}"
+          contracts_changed="${{ steps.pf.outputs.contracts }}"
+          infra_changed="${{ steps.pf.outputs.infra }}"
+          integration_changed="${{ steps.pf.outputs.integration }}"
+          e2e_changed="${{ steps.pf.outputs.e2e }}"
+          docs="${{ steps.pf.outputs.docs }}"
+          docker_changed="${{ steps.pf.outputs.docker }}"
+
+          only_docs=false
+          if [ "$docs" = "true" ] && [ "$go_changed" != "true" ] && [ "$frontend_changed" != "true" ] && [ "$docker_changed" != "true" ] && [ "$contracts_changed" != "true" ] && [ "$infra_changed" != "true" ] && [ "$integration_changed" != "true" ] && [ "$e2e_changed" != "true" ]; then
+            only_docs=true
+          fi
+
+          {
+            echo "only_docs=$only_docs"
+            echo "go_exists=$go_exists"
+            echo "go_changed=$go_changed"
+            echo "frontend_exists=$frontend_exists"
+            echo "frontend_changed=$frontend_changed"
+            echo "contracts_changed=$contracts_changed"
+            echo "infra_changed=$infra_changed"
+            echo "integration_changed=$integration_changed"
+            echo "e2e_changed=$e2e_changed"
+          } >> "$GITHUB_OUTPUT"
+
+      # Compute matrix of changed services that have a Dockerfile
+      - id: svcs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Determine diff range (PR vs push)
+          if [ -n "${{ github.base_ref }}" ]; then
+            range="${{ github.base_ref }}...${{ github.sha }}"
+          else
+            # For push events, compare with previous commit
+            range="HEAD~1"
+          fi
+
+          files=$(git diff --name-only $range || true)
+          # Extract unique service names under services/<name>/
+          mapfile -t svcs < <(echo "$files" | awk -F/ '/^services\/[^\/]+\// {print $2}' | sort -u)
+
+          json_items=()
+          any=false
+          for s in "${svcs[@]}"; do
+            if [ -f "services/$s/Dockerfile" ]; then
+              json_items+=("{\"name\":\"$s\"}")
+              any=true
+            fi
+          done
+
+          # Build matrix JSON
+          if [ ${#json_items[@]} -gt 0 ]; then
+            matrix_json="{\"include\":[${IFS=,; echo "${json_items[*]}"}]}"
+          else
+            matrix_json='{"include":[]}'
+          fi
+
+          echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
+          echo "any=$any" >> "$GITHUB_OUTPUT"
+
+  # 1) Meta — always runs (safe to make required)
+  meta:
+    name: Meta · actionlint / pr-title / gitleaks
+    needs: [changes]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: actionlint / PR title check / gitleaks"
+
+  # 2) Go / Lint — only when Go exists and it's not docs-only
+  go-lint:
+    name: Go · Lint
+    needs: [changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: setup-go, tidy -diff, go vet, golangci-lint"
+
+  # 3) Go / Test — depends on lint AND changes (to read outputs)
+  go-test:
+    name: Go · Test
+    needs: [go-lint, changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: go test ./... -race -coverprofile=coverage.out"
+      - run: echo "TODO: upload coverage artifact (guarded)"
+
+  # 4) Go / Build — compile all packages (no main required)
+  go-build:
+    name: Go · Build (packages)
+    needs: [go-test, changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: go build ./..."
+
+  # 5) Docker / Build — matrix over changed services with Dockerfile
+  docker-build:
+    name: Docker · Build (changed services)
+    needs: [go-build, changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.services_any == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.changes.outputs.services_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: buildx build services/${{ matrix.name }}"
+
+  # 6) Web / Lint + Type-Check
+  web-lint:
+    name: Web · Lint + Type-Check
+    needs: [changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: setup node, install, eslint, tsc --noEmit"
+
+  # 7) Web / Test — depends on lint AND changes
+  web-test:
+    name: Web · Test
+    needs: [web-lint, changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: run unit tests + upload coverage"
+
+  # 8) Web / Build — depends on test AND changes
+  web-build:
+    name: Web · Build
+    needs: [web-test, changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: npm/pnpm build (attach dist/ as artifact)"
+
+  # 9) Contracts — protobuf/openapi/graphql checks
+  contracts:
+    name: Contracts · API/IDL checks
+    needs: [changes]
+    if: ${{ needs.changes.outputs.contracts_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: buf lint/breaking, spectral lint, codegen cleanliness"
+
+  # 10) Integration — spin up deps + run integration tests
+  integration:
+    name: Integration · services up + tests
+    needs: [changes, go-build]
+    if: ${{ needs.changes.outputs.integration_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: services: or docker compose + go test -tags=integration"
+
+  # 11) E2E / UI — browser scenarios
+  e2e:
+    name: E2E · UI
+    needs: [changes, web-build]
+    if: ${{ needs.changes.outputs.e2e_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: Playwright/Cypress + upload videos/screenshots"
+
+  # 12) Security — lightweight vuln scans on PRs
+  security:
+    name: Security · vuln scan (light)
+    needs: [changes]
+    if: ${{ needs.changes.outputs.only_docs != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: govulncheck (Go), osv-scanner/npm audit (Web), trivy fs"
+
+  # 13) Infra / Lint — K8s/Helm/Terraform when changed
+  infra-lint:
+    name: Infra · Lint
+    needs: [changes]
+    if: ${{ needs.changes.outputs.infra_changed == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "TODO: kubeconform/kube-score/helm lint + tf fmt/validate/tfsec"
+
+  # 14) Summary — always runs, collects artifacts (non-blocking)
+  summary:
+    name: Summary · artifacts & recap
+    needs:
+      - meta
+      - go-lint
+      - go-test
+      - go-build
+      - docker-build
+      - web-lint
+      - web-test
+      - web-build
+      - contracts
+      - integration
+      - e2e
+      - security
+      - infra-lint
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "TODO: gather artifacts if exist (coverage, dist, logs)"
+          echo "This job always runs and is safe to make required alongside Meta."
