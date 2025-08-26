@@ -8,7 +8,9 @@ module.exports = {
     'scope-enum': [2, 'always', [
       'auth','user','file','share','gateway','worker','frontend','web','ml','inference',
       'storage','db','search','analytics','billing','payments','notifications','admin',
-      'security','api','contracts','perf','infra','deploy','charts','ci','repo','docs','tooling','scripts'
+      'security','api','contracts','perf','infra','deploy','charts','ci','repo','docs',
+      'tooling','scripts',
+      'go'
     ]],
     'scope-empty': [2, 'never'],
     'header-max-length': [2, 'always', 100],

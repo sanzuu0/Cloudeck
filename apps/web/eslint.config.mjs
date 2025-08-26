@@ -1,7 +1,9 @@
+// eslint.config.mjs
 import js from '@eslint/js';
 import tsParser from '@typescript-eslint/parser';
 import tsPlugin from '@typescript-eslint/eslint-plugin';
 import eslintConfigPrettier from 'eslint-config-prettier';
+import globals from 'globals';
 
 export default [
   {
@@ -12,8 +14,16 @@ export default [
       '**/.next/**',
       '**/coverage/**',
       '**/gen/**',
-      '**/.turbo/**'
-    ]
+      '**/.turbo/**',
+    ],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
+    },
   },
 
   js.configs.recommended,
@@ -24,14 +34,19 @@ export default [
       parser: tsParser,
       parserOptions: {
         ecmaVersion: 'latest',
-        sourceType: 'module'
-      }
+        sourceType: 'module',
+      },
+
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
     },
     plugins: { '@typescript-eslint': tsPlugin },
     rules: {
-      ...tsPlugin.configs.recommended.rules
-    }
+      ...tsPlugin.configs.recommended.rules,
+    },
   },
 
-  eslintConfigPrettier
+  eslintConfigPrettier,
 ];
