@@ -84,3 +84,35 @@ docker-compose.*.test.yml
 
 # --- Build артефакты общего вида ---
 dist/
+
+# --- Node / Frontend ---
+**/node_modules/
+**/.eslintcache
+**/.turbo/
+**/.next/
+**/coverage/
+**/.nyc_output/
+**/*.tsbuildinfo
+# Yarn (на случай Yarn Berry)
+.yarn/*
+!.yarn/releases
+!.yarn/plugins
+!.yarn/sdks
+!.yarn/versions
+# pnpm (иногда создаёт локальный store)
+.pnpm-debug.log
+
+# --- Husky (v9 не использует _/husky.sh) ---
+.husky/_
+
+# --- Editor/OS мусор ---
+*.swp
+*.swo
+*~
+
+# --- Docker (тестовые/локальные) ---
+Dockerfile.test
+
+# --- Генераторы/билды общего вида (вложенно) ---
+**/build/
+**/dist/
