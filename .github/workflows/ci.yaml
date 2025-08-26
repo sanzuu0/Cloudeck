@@ -18,6 +18,7 @@ permissions:
 env:
   GO_VERSION: '1.22.x'   # bump when you move
   NODE_VERSION: '20.x'
+  COVERAGE_MIN: '50'
 
 jobs:
   # 0) Routing — detect what changed and build flags/matrices
@@ -127,15 +128,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Determine diff range (PR vs push)
-          if [ -n "${{ github.base_ref }}" ]; then
-            range="${{ github.base_ref }}...${{ github.sha }}"
+          # Determine base and head SHAs for diff
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+            HEAD_SHA="${{ github.sha }}"
           else
-            # For push events, compare with previous commit
-            range="HEAD~1"
+            # push: compare previous commit to current
+            BASE_SHA="${{ github.event.before || '' }}"
+            if [ -z "$BASE_SHA" ]; then
+              # fallback for initial commit on a branch
+              BASE_SHA="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+            else
+              git fetch --no-tags --depth=1 origin "$BASE_SHA" || true
+            fi
+            HEAD_SHA="HEAD"
           fi
 
-          files=$(git diff --name-only $range || true)
+          files=$(git diff --name-only "$BASE_SHA...$HEAD_SHA" || true)
+
           # Extract unique service names under services/<name>/
           mapfile -t svcs < <(echo "$files" | awk -F/ '/^services\/[^\/]+\// {print $2}' | sort -u)
 
@@ -148,7 +159,6 @@ jobs:
             fi
           done
 
-          # Build matrix JSON
           if [ ${#json_items[@]} -gt 0 ]; then
             matrix_json="{\"include\":[${IFS=,; echo "${json_items[*]}"}]}"
           else
@@ -161,22 +171,169 @@ jobs:
   # 1) Meta — always runs (safe to make required)
   meta:
     name: Meta · actionlint / pr-title / gitleaks
-    needs: [changes]
+    needs: [ changes ]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+
+    # Extra permissions only for this job
+    permissions:
+      contents: read
+      pull-requests: read
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: actionlint / PR title check / gitleaks"
+        with:
+          fetch-depth: 0
+
+      # actionlint — validate all GitHub Actions workflows
+      - name: Install actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+            | bash -s -- -b . v1.6.26
+      - name: Run actionlint
+        run: ./actionlint -color
+
+      # PR title must follow Conventional Commits (on PRs only)
+      - name: Semantic PR title
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: amannn/action-semantic-pull-request@v5
+        with:
+          types: |
+            feat
+            fix
+            chore
+            docs
+            refactor
+            perf
+            test
+            ci
+            build
+            deps
+            revert
+          requireScope: false
+          wip: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # gitleaks — scan for secrets (fail on findings)
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --redact --source .
 
   # 2) Go / Lint — only when Go exists and it's not docs-only
   go-lint:
     name: Go · Lint
-    needs: [changes]
+    needs: [ changes ]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
+      GOCACHE: ${{ github.workspace }}/.cache/go/build
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: setup-go, tidy -diff, go vet, golangci-lint"
+        with:
+          fetch-depth: 0
+
+      # Setup Go (uses GO_VERSION from top-level env)
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false  # we'll do explicit caches below
+
+      # Restore Go module cache (shared for all modules)
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-
+
+      # Restore Go build cache
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOCACHE }}
+          key: ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-
+
+      # Install linters
+      - name: Install golangci-lint & gofumpt
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh \
+            | sudo bash -s -- -b /usr/local/bin v1.58.1
+          go install mvdan.cc/gofumpt@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          golangci-lint version
+          gofumpt -version || true
+
+      # Lint all Go modules (root + nested)
+      - name: Run tidy/vet/format/lint per module
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # collect module dirs: include root if it has go.mod
+          mods=()
+          if [ -f "go.mod" ]; then mods+=("."); fi
+          while IFS= read -r f; do
+            dir="$(dirname "$f")"
+            [ "$dir" = "." ] && continue
+            mods+=("$dir")
+          done < <(git ls-files "**/go.mod")
+
+          echo "Found modules: ${mods[*]:-(none)}"
+
+          for m in "${mods[@]}"; do
+            echo "::group::Go lint in $m"
+            pushd "$m" >/dev/null
+
+            # Warm deps (readonly to avoid accidental writes)
+            go mod download
+
+            # Enforce tidy cleanliness (fail if tidy changes files)
+            go mod tidy
+            if ! git diff --exit-code -- go.mod go.sum; then
+              echo "go.mod/go.sum not tidy in $m. Run 'go mod tidy' locally."
+              exit 1
+            fi
+
+            # Formatting (fail if any files need gofmt -s)
+            unformatted=$(gofmt -s -l . || true)
+            if [ -n "$unformatted" ]; then
+              echo "Unformatted (gofmt -s) in $m:"
+              echo "$unformatted"
+              echo "Run: gofmt -s -w ."
+              exit 1
+            fi
+
+            # Stricter formatting (gofumpt)
+            bad_gofumpt=$(gofumpt -l . || true)
+            if [ -n "$bad_gofumpt" ]; then
+              echo "gofumpt wants changes in $m:"
+              echo "$bad_gofumpt"
+              echo "Run: gofumpt -w ."
+              exit 1
+            fi
+
+            # Basic analysis
+            go vet ./...
+
+            # Static analysis
+            golangci-lint run ./...
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
 
   # 3) Go / Test — depends on lint AND changes (to read outputs)
   go-test:
@@ -184,10 +341,164 @@ jobs:
     needs: [go-lint, changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
+      GOCACHE: ${{ github.workspace }}/.cache/go/build
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: go test ./... -race -coverprofile=coverage.out"
-      - run: echo "TODO: upload coverage artifact (guarded)"
+        with:
+          fetch-depth: 0
+
+      # Setup Go (uses GO_VERSION from top-level env)
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # Restore Go module cache
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-
+
+      # Restore Go build cache
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOCACHE }}
+          key: ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-
+
+      # JUnit converter
+      - name: Install go-junit-report
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install github.com/jstemmer/go-junit-report/v2@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+
+      # Run tests per module (root + nested), collect coverage + JUnit + shuffle
+      - name: Run unit tests (race, shuffle) with coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          root="$(pwd)"
+          mkdir -p "__junit" "__gocov"
+
+          # Collect Go modules (include root if go.mod exists)
+          mods=()
+          if [ -f "go.mod" ]; then mods+=("."); fi
+          while IFS= read -r f; do
+            dir="$(dirname "$f")"
+            [ "$dir" = "." ] && continue
+            mods+=("$dir")
+          done < <(git ls-files "**/go.mod")
+
+          echo "Testing modules: ${mods[*]:-(none)}"
+
+          overall=0
+          for m in "${mods[@]}"; do
+            echo "::group::go test in $m"
+            pushd "$m" >/dev/null
+
+            go mod download
+
+            safe="$(echo "$m" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            log="$root/__junit/${safe}.txt"
+            gotmpcov="coverage.tmp"
+
+            # -shuffle=on для выявления зависимостей порядка
+            set +e
+            go test ./... -v -race -shuffle=on -timeout=10m -covermode=atomic -coverprofile="$gotmpcov" 2>&1 | tee "$log"
+            st=${PIPESTATUS[0]}
+            set -e
+            if [ $st -ne 0 ]; then overall=1; fi
+
+            if [ -s "$gotmpcov" ]; then
+              mv "$gotmpcov" "$root/__gocov/coverage-${safe}.out"
+            else
+              rm -f "$gotmpcov"
+            fi
+
+            # Преобразуем лог в JUnit XML
+            $HOME/go/bin/go-junit-report -set-exit-code < "$log" > "$root/__junit/${safe}.xml" || true
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+          # Merge coverage files if we have any
+          if compgen -G "__gocov/coverage-*.out" > /dev/null; then
+            echo "mode: atomic" > coverage.out
+            for f in __gocov/coverage-*.out; do
+              grep -h -v '^mode:' "$f" >> coverage.out || true
+            done
+            # Optional HTML report for convenient review
+            go tool cover -html=coverage.out -o coverage.html
+
+            # Check coverage threshold
+            pct="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}' | tr -d '%')"
+            min="${COVERAGE_MIN:-50}"
+            awk -v p="$pct" -v m="$min" 'BEGIN{ if ((p+0) < (m+0)) { exit 1 } }' || {
+              echo "Coverage ${pct}% is below threshold ${min}%";
+              overall=1;
+            }
+          else
+            echo "No coverage files produced."
+          fi
+
+          exit $overall
+
+      # Upload coverage artifacts if present
+      - name: Upload coverage.out
+        if: ${{ hashFiles('coverage.out') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage
+          path: coverage.out
+          retention-days: 7
+
+      - name: Upload coverage.html
+        if: ${{ hashFiles('coverage.html') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-coverage-html
+          path: coverage.html
+          retention-days: 7
+
+      # Upload JUnit XMLs
+      - name: Upload JUnit reports
+        if: ${{ hashFiles('__junit/*.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-junit
+          path: __junit/*.xml
+          retention-days: 7
+
+      # Annotate PR with JUnit (runs even if tests failed)
+      - name: Publish JUnit report (annotations)
+        if: ${{ always() }}
+        uses: mikepenz/action-junit-report@v4
+        with:
+          report_paths: '__junit/*.xml'
+          check_name: 'Go unit tests'
+          require_tests: true
+          fail_on_failure: false
+
+      - name: Coverage summary
+        if: ${{ hashFiles('coverage.out') != '' }}
+        run: |
+          pct="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')"
+          echo "### Go coverage: ${pct}" >> "$GITHUB_STEP_SUMMARY"
+
 
   # 4) Go / Build — compile all packages (no main required)
   go-build:
@@ -195,9 +506,70 @@ jobs:
     needs: [go-test, changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
+      GOCACHE: ${{ github.workspace }}/.cache/go/build
+      CGO_ENABLED: "0"        # safe default; flip to 1 if a module needs cgo
+      GOFLAGS: "-trimpath"    # reproducible builds
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: go build ./..."
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOCACHE }}
+          key: ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-
+
+      - name: Build all packages per module (root + nested)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # collect modules
+          mods=()
+          if [ -f "go.mod" ]; then mods+=("."); fi
+          while IFS= read -r f; do
+            dir="$(dirname "$f")"
+            [ "$dir" = "." ] && continue
+            mods+=("$dir")
+          done < <(git ls-files "**/go.mod")
+
+          echo "Building modules: ${mods[*]:-(none)}"
+
+          for m in "${mods[@]}"; do
+            echo "::group::go build in $m"
+            pushd "$m" >/dev/null
+
+            # make sure deps are present
+            go mod download
+
+            # compile ALL packages; no need to produce binaries
+            # -buildvcs=false to avoid VCS metadata variability on CI
+            go build -buildvcs=false ./...
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
 
   # 5) Docker / Build — matrix over changed services with Dockerfile
   docker-build:
@@ -208,9 +580,51 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.changes.outputs.services_matrix) }}
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: buildx build services/${{ matrix.name }}"
+
+      # Buildx for caching & fast builds (no push on PRs)
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Optional: Dockerfile lint (non-blocking for now)
+      - name: Hadolint (non-blocking)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: services/${{ matrix.name }}/Dockerfile
+          verbose: true
+        continue-on-error: true
+
+      - name: Stamp build time
+        id: dt
+        shell: bash
+        run: echo "now=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Build image for the changed service (no push)
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.name }}
+          file: services/${{ matrix.name }}/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: false
+          pull: true
+          # Reproducible & cached builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Helpful tags/labels even for PR builds
+          tags: cloudeck/${{ matrix.name }}:pr-${{ github.event.pull_request.number || github.run_number }}
+          labels: |
+            org.opencontainers.image.source=${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.dt.outputs.now }}
+            org.opencontainers.image.title=${{ matrix.name }}
+          # (optional) build args you commonly pass in images
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ steps.dt.outputs.now }}
 
   # 6) Web / Lint + Type-Check
   web-lint:
@@ -218,69 +632,1114 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: setup node, install, eslint, tsc --noEmit"
+        with:
+          fetch-depth: 0
 
-  # 7) Web / Test — depends on lint AND changes
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Cache package-manager stores (covers multi-project repos)
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+      - name: Cache yarn cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/yarn
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Cache npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Enable Corepack (pnpm/yarn)
+        run: corepack enable
+
+      - name: Lint & Type-Check per frontend app
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Discover frontend roots (root, apps/*, web/)
+          mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
+                                | xargs -n1 dirname | sort -u)
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "No frontend roots found."
+            exit 0
+          fi
+
+          for r in "${roots[@]}"; do
+            echo "::group::Frontend checks in $r"
+            pushd "$r" >/dev/null
+
+            # Detect package manager
+            pm="npm"
+            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
+            elif [ -f "yarn.lock" ];     then pm="yarn"
+            elif [ -f "package-lock.json" ]; then pm="npm"
+            fi
+            echo "Package manager: $pm"
+
+            # Install deps (frozen/immutable)
+            case "$pm" in
+              pnpm)
+                corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+                pnpm install --frozen-lockfile
+                ;;
+              yarn)
+                if [ -f ".yarnrc.yml" ]; then
+                  yarn install --immutable
+                else
+                  yarn install --frozen-lockfile
+                fi
+                ;;
+              npm)
+                npm ci
+                ;;
+            esac
+
+            # Helpers to exec local binaries
+            exec_cmd() {
+              case "$pm" in
+                pnpm) pnpm exec "$@" ;;
+                yarn) yarn -s run "$@" ;;
+                npm)  npx --yes "$@" ;;
+              esac
+            }
+
+            # Detect ESLint & TypeScript presence
+            has_eslint=false
+            has_ts=false
+            if [ -f ".eslintrc" ] || ls .eslintrc.* >/dev/null 2>&1 || grep -q '"eslint"' package.json; then
+              has_eslint=true
+            fi
+            if [ -f "tsconfig.json" ] || grep -q '"typescript"' package.json; then
+              has_ts=true
+            fi
+
+            # ESLint (fail on warnings)
+            if $has_eslint; then
+              echo "Running ESLint…"
+              exec_cmd eslint . --max-warnings=0
+            else
+              echo "Skip ESLint (no config/dependency)."
+            fi
+
+            # TypeScript type-check
+            if $has_ts; then
+              echo "Running TypeScript type-check…"
+              # Prefer script if present, else call tsc directly
+              if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
+                case "$pm" in
+                  pnpm) pnpm run -s typecheck ;;
+                  yarn) yarn -s run typecheck ;;
+                  npm)  npm run -s typecheck ;;
+                esac
+              else
+                exec_cmd tsc --noEmit
+              fi
+            else
+              echo "Skip TS check (no tsconfig/dependency)."
+            fi
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+  # 7) Web / Test — run unit tests per frontend app and collect coverage
   web-test:
     name: Web · Test
-    needs: [web-lint, changes]
+    needs: [ web-lint, changes ]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: run unit tests + upload coverage"
+        with:
+          fetch-depth: 0
 
-  # 8) Web / Build — depends on test AND changes
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Caches for pnpm / yarn / npm (reused pattern from web-lint)
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+      - name: Cache yarn cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/yarn
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Cache npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Enable Corepack (pnpm/yarn)
+        run: corepack enable
+
+      - name: Run unit tests (Jest/Vitest) and collect coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p "__coverage"
+
+          # Discover frontend roots
+          mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
+                                | xargs -n1 dirname | sort -u)
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "No frontend roots found."
+            exit 0
+          fi
+
+          for r in "${roots[@]}"; do
+            echo "::group::Frontend tests in $r"
+            pushd "$r" >/dev/null
+
+            # Detect package manager
+            pm="npm"
+            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
+            elif [ -f "yarn.lock" ];     then pm="yarn"
+            elif [ -f "package-lock.json" ]; then pm="npm"
+            fi
+            echo "Package manager: $pm"
+
+            # Frozen/immutable installs
+            case "$pm" in
+              pnpm)
+                corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+                pnpm install --frozen-lockfile
+                ;;
+              yarn)
+                if [ -f ".yarnrc.yml" ]; then
+                  yarn install --immutable
+                else
+                  yarn install --frozen-lockfile
+                fi
+                ;;
+              npm)
+                npm ci
+                ;;
+            esac
+
+            # Helper to exec local binaries
+            exec_cmd() {
+              case "$pm" in
+                pnpm) pnpm exec "$@" ;;
+                yarn) yarn -s run "$@" ;;
+                npm)  npx --yes "$@" ;;
+              esac
+            }
+
+            # Detect framework and presence of tests
+            has_jest=false
+            has_vitest=false
+            has_test_script=false
+
+            if jq -e '.dependencies.jest // .devDependencies.jest' package.json >/dev/null 2>&1; then
+              has_jest=true
+            elif jq -e '.dependencies["@jest/globals"] // .devDependencies["@jest/globals"]' package.json >/dev/null 2>&1; then
+              has_jest=true
+            fi
+            if jq -e '.dependencies.vitest // .devDependencies.vitest' package.json >/dev/null 2>&1; then
+              has_vitest=true
+            fi
+            if jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+              has_test_script=true
+            fi
+
+            # Run tests; prefer explicit framework to enforce coverage
+            ran=false
+            if $has_jest; then
+              echo "Running Jest with coverage…"
+              exec_cmd jest --ci --coverage
+              ran=true
+            elif $has_vitest; then
+              echo "Running Vitest with coverage…"
+              exec_cmd vitest run --coverage
+              ran=true
+            elif $has_test_script; then
+              echo "Running package.json test script…"
+              case "$pm" in
+                pnpm) pnpm run -s test ;;
+                yarn) yarn -s run test ;;
+                npm)  npm run -s test ;;
+              esac
+              ran=true
+            else
+              echo "No test framework or script detected — skipping tests for $r."
+            fi
+
+            # Collect coverage if produced
+            if [ -d "coverage" ] || [ -f "coverage/lcov.info" ]; then
+              dest="../../__coverage/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+              mkdir -p "$dest"
+              cp -R coverage/* "$dest/" 2>/dev/null || true
+              echo "Coverage collected to $dest"
+            elif $ran; then
+              echo "No coverage folder found (framework may be configured without coverage)."
+            fi
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Upload web coverage artifacts
+        if: ${{ hashFiles('__coverage/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-coverage
+          path: __coverage/**
+          retention-days: 7
+
+  # 8) Web / Build — produce build artifacts per frontend app
   web-build:
     name: Web · Build
     needs: [web-test, changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+      # Prevent Node OOM on larger builds (safe default)
+      NODE_OPTIONS: --max_old_space_size=4096
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: npm/pnpm build (attach dist/ as artifact)"
+        with:
+          fetch-depth: 0
 
-  # 9) Contracts — protobuf/openapi/graphql checks
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Reuse caches (same pattern as web-lint/web-test)
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+      - name: Cache yarn cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/yarn
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Cache npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Enable Corepack (pnpm/yarn)
+        run: corepack enable
+
+      - name: Build each frontend and collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p "__dist"
+
+          # Discover frontend roots
+          mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
+                                | xargs -n1 dirname | sort -u)
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "No frontend roots found."
+            exit 0
+          fi
+
+          for r in "${roots[@]}"; do
+            echo "::group::Build in $r"
+            pushd "$r" >/dev/null
+
+            # Detect package manager
+            pm="npm"
+            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
+            elif [ -f "yarn.lock" ];     then pm="yarn"
+            elif [ -f "package-lock.json" ]; then pm="npm"
+            fi
+            echo "Package manager: $pm"
+
+            # Install deps (frozen/immutable)
+            case "$pm" in
+              pnpm)
+                corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+                pnpm install --frozen-lockfile
+                ;;
+              yarn)
+                if [ -f ".yarnrc.yml" ]; then
+                  yarn install --immutable
+                else
+                  yarn install --frozen-lockfile
+                fi
+                ;;
+              npm)
+                npm ci
+                ;;
+            esac
+
+            # Helper to exec local binaries
+            exec_cmd() {
+              case "$pm" in
+                pnpm) pnpm exec "$@" ;;
+                yarn) yarn -s run "$@" ;;
+                npm)  npx --yes "$@" ;;
+              esac
+            }
+
+            # Prefer package.json "build" script; fallback to common tools
+            if jq -e '.scripts.build' package.json >/dev/null 2>&1; then
+              echo "Running package.json build…"
+              case "$pm" in
+                pnpm) pnpm run -s build ;;
+                yarn) yarn -s run build ;;
+                npm)  npm run -s build ;;
+              esac
+            else
+              echo "No build script. Trying common defaults…"
+              if jq -e '.dependencies.vite // .devDependencies.vite' package.json >/dev/null 2>&1; then
+                exec_cmd vite build
+              elif jq -e '.dependencies.next // .devDependencies.next' package.json >/dev/null 2>&1; then
+                exec_cmd next build || true
+                # export static if configured
+                if jq -e '.scripts.export' package.json >/dev/null 2>&1; then
+                  case "$pm" in
+                    pnpm) pnpm run -s export ;;
+                    yarn) yarn -s run export ;;
+                    npm)  npm run -s export ;;
+                  esac
+                fi
+              elif jq -e '.dependencies["react-scripts"] // .devDependencies["react-scripts"]' package.json >/dev/null 2>&1; then
+                exec_cmd react-scripts build
+              else
+                echo "Skip: no known build tool or script."
+              fi
+            fi
+
+            # Collect artifacts from common output dirs
+            out_base="../__dist/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            mkdir -p "$out_base"
+            copied=false
+            for d in dist build .next out public/build; do
+              if [ -d "$d" ]; then
+                echo "Collecting $d → $out_base/$d"
+                mkdir -p "$out_base/$d"
+                rsync -a --delete "$d/" "$out_base/$d/" || cp -R "$d" "$out_base/" || true
+                copied=true
+              fi
+            done
+            if ! $copied; then
+              echo "No standard output directories found in $r."
+            fi
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Upload web dist artifacts
+        if: ${{ hashFiles('__dist/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: __dist/**
+          retention-days: 7
+
+  # 9) Contracts — protobuf/openapi/graphql checks (runs only when contracts changed)
   contracts:
     name: Contracts · API/IDL checks
     needs: [changes]
     if: ${{ needs.changes.outputs.contracts_changed == 'true' }}
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+      BASE_REF: ${{ github.base_ref || 'main' }}
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: buf lint/breaking, spectral lint, codegen cleanliness"
+        with:
+          fetch-depth: 0
 
-  # 10) Integration — spin up deps + run integration tests
+      # Node is needed for Spectral and GraphQL Inspector
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # -------- Protobuf (buf) --------
+      - name: Setup buf CLI
+        id: buf-setup
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          # use default latest; pin later if you want
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Protobuf · lint & breaking (workspace-aware)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # detect buf config at repo root (workspace or single module)
+          if [ -f "buf.yaml" ] || [ -f "buf.work.yaml" ]; then
+            echo "buf config detected."
+            # fetch base for breaking diff
+            git fetch --no-tags origin "$BASE_REF":"refs/remotes/origin/$BASE_REF"
+
+            echo "::group::buf lint"
+            buf lint
+            echo "::endgroup::"
+
+            echo "::group::buf breaking vs origin/$BASE_REF"
+            # compare against base branch
+            buf breaking --against ".git#branch=origin/$BASE_REF"
+            echo "::endgroup::"
+
+            # Optional deterministic codegen if template present
+            if [ -f "buf.gen.yaml" ] || [ -f "buf.gen.yml" ]; then
+              echo "::group::buf generate (determinism check)"
+              buf generate
+              if ! git diff --exit-code -- . ':!**/.git/**'; then
+                echo "Generated files changed. Commit generated outputs or fix template."
+                exit 1
+              fi
+              echo "::endgroup::"
+            else
+              echo "No buf.gen.yaml — skip codegen determinism."
+            fi
+          else
+            echo "No buf.yaml/buf.work.yaml — skip Protobuf checks."
+          fi
+
+      # -------- OpenAPI (Spectral) --------
+      - name: OpenAPI · spectral lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mapfile -t specfiles < <(git ls-files '**/openapi.yaml' '**/openapi.yml' '**/openapi.json')
+          if [ ${#specfiles[@]} -eq 0 ]; then
+            echo "No OpenAPI files found — skip Spectral."
+            exit 0
+          fi
+
+          # install spectral on demand
+          npx --yes @stoplight/spectral-cli --version >/dev/null
+
+          failed=0
+          for f in "${specfiles[@]}"; do
+            echo "::group::spectral lint $f"
+            if ! npx --yes @stoplight/spectral-cli lint "$f"; then
+              failed=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $failed
+
+      # -------- GraphQL (breaking changes) --------
+      - name: GraphQL · breaking changes (graphql-inspector)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # find schema files; adjust patterns if your repo uses a different layout
+          mapfile -t schemas < <(git ls-files '**/schema.graphql' 'schema.graphql' 'graphql/schema.graphql' '**/*.graphql' | sort -u)
+          if [ ${#schemas[@]} -eq 0 ]; then
+            echo "No GraphQL schema files found — skip GraphQL checks."
+            exit 0
+          fi
+
+          # ensure base branch is available
+          git fetch --no-tags origin "$BASE_REF":"refs/remotes/origin/$BASE_REF"
+
+          # install inspector on demand
+          npx --yes @graphql-inspector/cli --version >/dev/null || npx --yes graphql-inspector --help >/dev/null
+
+          mkdir -p __base_schema
+          had_any=false
+          overall=0
+
+          for s in "${schemas[@]}"; do
+            # Try to get base version of the schema file
+            if git cat-file -e "origin/$BASE_REF:$s" 2>/dev/null; then
+              had_any=true
+              mkdir -p "$(dirname "__base_schema/$s")"
+              git show "origin/$BASE_REF:$s" > "__base_schema/$s"
+
+              echo "::group::graphql-inspector diff $s"
+              if ! npx --yes graphql-inspector diff "__base_schema/$s" "$s" --fail-on-breaking; then
+                overall=1
+              fi
+              echo "::endgroup::"
+            fi
+          done
+
+          if ! $had_any; then
+            echo "No matching schema files on origin/$BASE_REF — skip diff (new files)."
+            overall=0
+          fi
+
+          exit $overall
+
+      # -------- GraphQL Codegen determinism (optional) --------
+      - name: GraphQL · codegen determinism (if codegen config found)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Supported common config names
+          cfg=""
+          for c in "codegen.yml" "codegen.yaml" "codegen.ts" "graphql-codegen.yml" "graphql-codegen.yaml"; do
+            if [ -f "$c" ]; then cfg="$c"; break; fi
+          done
+          if [ -z "$cfg" ]; then
+            echo "No GraphQL codegen config found — skip."
+            exit 0
+          fi
+
+          echo "::group::graphql-codegen"
+          npx --yes @graphql-codegen/cli -c "$cfg"
+          if ! git diff --exit-code -- . ':!**/.git/**'; then
+            echo "GraphQL generated files changed. Commit generated outputs or fix codegen config."
+            exit 1
+          fi
+          echo "::endgroup::"
+
+  # 10) Integration — spin up deps (compose or local) + run integration tests
   integration:
     name: Integration · services up + tests
     needs: [changes, go-build]
     if: ${{ needs.changes.outputs.integration_changed == 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
+      GOCACHE:    ${{ github.workspace }}/.cache/go/build
+      GO_VERSION: ${{ env.GO_VERSION }}
+      # Common integration envs your tests can read (override in repo if needed)
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/app?sslmode=disable
+      REDIS_ADDR:   127.0.0.1:6379
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: services: or docker compose + go test -tags=integration"
+        with:
+          fetch-depth: 0
 
-  # 11) E2E / UI — browser scenarios
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOMODCACHE }}
+          key: ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-gomods-${{ env.GO_VERSION }}-
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.GOCACHE }}
+          key: ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-gobuild-${{ env.GO_VERSION }}-
+
+      # ---------- Mode A: docker-compose.test.yml present ----------
+      - name: Detect docker-compose.test.yml
+        id: has_compose
+        shell: bash
+        run: |
+          if [ -f "docker-compose.test.yml" ] || [ -f "docker-compose.test.yaml" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compose up (if present)
+        if: ${{ steps.has_compose.outputs.present == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="docker-compose.test.yml"
+          [ -f "$FILE" ] || FILE="docker-compose.test.yaml"
+          docker compose -f "$FILE" pull --quiet || true
+          docker compose -f "$FILE" up -d --quiet-pull
+          docker compose -f "$FILE" ps
+
+      - name: Wait for services (compose)
+        if: ${{ steps.has_compose.outputs.present == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          wait_port() { local host=$1 port=$2; echo "Waiting for $host:$port..."; for i in {1..60}; do (echo >/dev/tcp/$host/$port) >/dev/null 2>&1 && { echo "OK $host:$port"; return 0; }; sleep 2; done; echo "Timeout $host:$port"; return 1; }
+          wait_port 127.0.0.1 5432 || true
+          wait_port 127.0.0.1 6379 || true
+          wait_port 127.0.0.1 9000 || true
+          wait_port 127.0.0.1 9092 || true
+
+      # ---------- Mode B: fallback to local lightweight deps ----------
+      - name: Start Postgres + Redis (fallback)
+        if: ${{ steps.has_compose.outputs.present != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker rm -f it_pg it_redis >/dev/null 2>&1 || true
+
+          docker run -d --name it_pg -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres -e POSTGRES_DB=app \
+            --health-cmd="pg_isready -U postgres" --health-interval=5s --health-timeout=5s --health-retries=20 \
+            postgres:16-alpine
+
+          docker run -d --name it_redis -p 6379:6379 \
+            --health-cmd="redis-cli ping || exit 1" --health-interval=5s --health-timeout=3s --health-retries=20 \
+            redis:7-alpine
+
+          echo "Waiting for Postgres health..."
+          docker wait --condition=healthy it_pg
+          echo "Waiting for Redis health..."
+          docker wait --condition=healthy it_redis
+
+      # ---------- Optional: run DB migrations if ./migrations exists ----------
+      - name: Apply migrations (optional)
+        if: ${{ steps.has_compose.outputs.present != 'true' && hashFiles('migrations/**') != '' }}
+        shell: bash
+        env:
+          DB_URL: ${{ env.DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          echo "migrations/ detected — applying..."
+          curl -sSL https://github.com/golang-migrate/migrate/releases/download/v4.16.2/migrate.linux-amd64.tar.gz | tar -xz -C /usr/local/bin migrate
+          chmod +x /usr/local/bin/migrate
+          migrate -path migrations -database "$DB_URL" up
+
+      # ---------- Run Go integration tests (stability flags) ----------
+      - name: Run integration tests
+        shell: bash
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          REDIS_ADDR:   ${{ env.REDIS_ADDR }}
+        run: |
+          set -euo pipefail
+          # -p=2 уменьшает флейки из-за гонок/ресурсов; явный timeout спасает от зависаний
+          go test ./... -tags=integration -count=1 -v -p=2 -timeout=15m -shuffle=on
+
+      # ---------- Collect logs on failure ----------
+      - name: Collect docker logs (compose)
+        if: ${{ failure() && steps.has_compose.outputs.present == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p __it_logs
+          FILE="docker-compose.test.yml"; [ -f "$FILE" ] || FILE="docker-compose.test.yaml"
+          docker compose -f "$FILE" logs --no-color > __it_logs/compose.log || true
+
+      - name: Collect docker logs (fallback)
+        if: ${{ failure() && steps.has_compose.outputs.present != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p __it_logs
+          docker logs it_pg    > __it_logs/postgres.log 2>&1 || true
+          docker logs it_redis > __it_logs/redis.log    2>&1 || true
+
+      - name: Upload integration logs
+        if: ${{ failure() && hashFiles('__it_logs/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: __it_logs/**
+          retention-days: 7
+
+      # ---------- Cleanup ----------
+      - name: Compose down
+        if: ${{ always() && steps.has_compose.outputs.present == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE="docker-compose.test.yml"; [ -f "$FILE" ] || FILE="docker-compose.test.yaml"
+          docker compose -f "$FILE" down -v --remove-orphans
+
+      - name: Stop fallback containers
+        if: ${{ always() && steps.has_compose.outputs.present != 'true' }}
+        shell: bash
+        run: |
+          docker rm -f it_pg it_redis >/dev/null 2>&1 || true
+
+  # 11) E2E / UI — browser scenarios (Playwright/Cypress), only when asked
   e2e:
     name: E2E · UI
     needs: [changes, web-build]
-    if: ${{ needs.changes.outputs.e2e_changed == 'true' }}
+    # Run when: (a) e2e files changed, or (b) manual dispatch, or (c) PR labeled "e2e"
+    if: ${{ needs.changes.outputs.only_docs != 'true'
+      && needs.changes.outputs.frontend_exists == 'true'
+      && (
+      needs.changes.outputs.e2e_changed == 'true'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request'
+      && contains(github.event.pull_request.labels.*.name, 'e2e'))
+      ) }}
     runs-on: ubuntu-latest
+
+    env:
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+      # This folder will collect per-app artifacts
+      E2E_ART_DIR: __e2e
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: Playwright/Cypress + upload videos/screenshots"
+        with:
+          fetch-depth: 0
 
-  # 12) Security — lightweight vuln scans on PRs
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Reuse caches (same pattern as other web jobs)
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-
+      - name: Cache yarn cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/yarn
+          key: ${{ runner.os }}-yarn-${{ hashFiles('**/yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+      - name: Cache npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Enable Corepack (pnpm/yarn)
+        run: corepack enable
+
+      - name: Run E2E per frontend app (Playwright/Cypress)
+        shell: bash
+        env:
+          E2E_ART_DIR: ${{ env.E2E_ART_DIR }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p "$E2E_ART_DIR"
+
+          # Discover frontend roots (root, apps/*, web/)
+          mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
+                                | xargs -n1 dirname | sort -u)
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "No frontend roots found."
+            exit 0
+          fi
+
+          for r in "${roots[@]}"; do
+            echo "::group::E2E in $r"
+            pushd "$r" >/dev/null
+
+            # Detect package manager
+            pm="npm"
+            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
+            elif [ -f "yarn.lock" ];     then pm="yarn"
+            elif [ -f "package-lock.json" ]; then pm="npm"
+            fi
+            echo "Package manager: $pm"
+
+            # Install deps (frozen/immutable)
+            case "$pm" in
+              pnpm)
+                corepack prepare pnpm@latest --activate >/dev/null 2>&1 || true
+                pnpm install --frozen-lockfile
+                ;;
+              yarn)
+                if [ -f ".yarnrc.yml" ]; then
+                  yarn install --immutable
+                else
+                  yarn install --frozen-lockfile
+                fi
+                ;;
+              npm)
+                npm ci
+                ;;
+            esac
+
+            # Helper to exec local binaries
+            exec_cmd() {
+              case "$pm" in
+                pnpm) pnpm exec "$@" ;;
+                yarn) yarn -s run "$@" ;;
+                npm)  npx --yes "$@" ;;
+              esac
+            }
+
+            # Detect Playwright / Cypress
+            has_playwright=false
+            has_cypress=false
+
+            if [ -f "playwright.config.ts" ] || [ -f "playwright.config.js" ] \
+               || jq -e '.dependencies."@playwright/test" // .devDependencies."@playwright/test"' package.json >/dev/null 2>&1; then
+              has_playwright=true
+            fi
+            if [ -f "cypress.config.ts" ] || [ -f "cypress.config.js" ] || [ -f "cypress.json" ] \
+               || jq -e '.dependencies.cypress // .devDependencies.cypress' package.json >/dev/null 2>&1; then
+              has_cypress=true
+            fi
+
+            # Run Playwright E2E
+            if $has_playwright; then
+              echo "Playwright detected — installing browsers and running tests…"
+              exec_cmd playwright install --with-deps
+              if ! exec_cmd playwright test; then
+                pw_status=$?
+              else
+                pw_status=0
+              fi
+
+              # Collect typical Playwright artifacts
+              dest="../$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/playwright"
+              mkdir -p "$dest"
+              for d in playwright-report test-results blob-report; do
+                if [ -d "$d" ]; then
+                  echo "Collecting $d → $dest/$d"
+                  mkdir -p "$dest/$d"
+                  rsync -a "$d/" "$dest/$d/" || cp -R "$d" "$dest/" || true
+                fi
+              done
+
+              if [ ${pw_status:-0} -ne 0 ]; then
+                echo "Playwright tests failed in $r"
+                exit $pw_status
+              fi
+            fi
+
+            # Run Cypress E2E
+            if $has_cypress; then
+              echo "Cypress detected — verifying and running tests…"
+              exec_cmd cypress verify || true
+              # Default headless run (Electron/Chrome depending on project)
+              if ! exec_cmd cypress run --headless; then
+                cy_status=$?
+              else
+                cy_status=0
+              fi
+
+              # Collect typical Cypress artifacts
+              dest="../$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/cypress"
+              mkdir -p "$dest"
+              for d in cypress/videos cypress/screenshots cypress/results; do
+                if [ -d "$d" ]; then
+                  echo "Collecting $d → $dest/$(basename "$d")"
+                  mkdir -p "$dest/$(basename "$d")"
+                  rsync -a "$d/" "$dest/$(basename "$d")/" || cp -R "$d" "$dest/" || true
+                fi
+              done
+
+              if [ ${cy_status:-0} -ne 0 ]; then
+                echo "Cypress tests failed in $r"
+                exit $cy_status
+              fi
+            fi
+
+            if ! $has_playwright && ! $has_cypress; then
+              echo "No Playwright/Cypress config in $r — skipping."
+            fi
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Upload E2E artifacts
+        if: ${{ hashFiles(format('{0}/**', env.E2E_ART_DIR)) != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: ${{ env.E2E_ART_DIR }}/**
+          retention-days: 7
+
+
+  # 12) Security — lightweight vuln scans on PRs (warning-only)
   security:
     name: Security · vuln scan (light)
     needs: [changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' }}
     runs-on: ubuntu-latest
+
+    env:
+      GO_VERSION: ${{ env.GO_VERSION }}
+      NODE_VERSION: ${{ env.NODE_VERSION }}
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: govulncheck (Go), osv-scanner/npm audit (Web), trivy fs"
+        with:
+          fetch-depth: 0
+
+      # ---------- Go: govulncheck per module (warning-only) ----------
+      - name: Setup Go
+        if: ${{ needs.changes.outputs.go_exists == 'true' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Go · govulncheck (all modules)
+        if: ${{ needs.changes.outputs.go_exists == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+
+          mods=()
+          if [ -f "go.mod" ]; then mods+=("."); fi
+          while IFS= read -r f; do
+            d="$(dirname "$f")"; [ "$d" = "." ] && continue; mods+=("$d")
+          done < <(git ls-files "**/go.mod")
+
+          mkdir -p "__sec"
+          overall=0
+
+          for m in "${mods[@]}"; do
+            echo "::group::govulncheck in $m"
+            if ! govulncheck ./... -C "$m" | tee "__sec/govulncheck-$(echo "$m" | sed 's#[^a-zA-Z0-9_-]#_#g').log"; then
+              # warning-only: do not fail the job
+              overall=0
+            fi
+            echo "::endgroup::"
+          done
+
+          exit $overall
+
+      # ---------- Web: npm/yarn/pnpm audit (warning-only) ----------
+      - name: Setup Node
+        if: ${{ needs.changes.outputs.frontend_exists == 'true' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Enable Corepack (pnpm/yarn)
+        if: ${{ needs.changes.outputs.frontend_exists == 'true' }}
+        run: corepack enable
+
+      - name: Web · audit per frontend root
+        if: ${{ needs.changes.outputs.frontend_exists == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          mkdir -p "__sec/web"
+          mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
+                                | xargs -n1 dirname | sort -u)
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "No frontend roots."
+            exit 0
+          fi
+
+          for r in "${roots[@]}"; do
+            echo "::group::audit in $r"
+            pushd "$r" >/dev/null
+
+            pm="npm"
+            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
+            elif [ -f "yarn.lock" ];     then pm="yarn"
+            elif [ -f "package-lock.json" ]; then pm="npm"
+            fi
+            echo "PM: $pm"
+
+            status=0
+            case "$pm" in
+              pnpm)
+                pnpm audit || status=$?
+                ;;
+              yarn)
+                (yarn npm audit --all --environment production || yarn npm audit --all) || status=$?
+                ;;
+              npm)
+                npm audit --audit-level=high || status=$?
+                ;;
+            esac
+
+            echo "pm=$pm exit=$status" > "../__sec/web/audit-$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g').txt"
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+          # warning-only: never fail here
+
+      # ---------- Trivy: file-system scan (CRITICAL,HIGH; warning-only) ----------
+      - name: Trivy FS scan (CRITICAL,HIGH)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          ignore-unfixed: true
+          format: table
+          severity: CRITICAL,HIGH
+          skip-dirs: |
+            node_modules
+            **/dist
+            **/build
+            **/.next
+          exit-code: '0'   # warning-only
+
+      # ---------- Upload Security artifacts (if any) ----------
+      - name: Upload security logs
+        if: ${{ hashFiles('__sec/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-logs
+          path: __sec/**
+          retention-days: 7
 
   # 13) Infra / Lint — K8s/Helm/Terraform when changed
   infra-lint:
@@ -288,11 +1747,155 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.infra_changed == 'true' }}
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-      - run: echo "TODO: kubeconform/kube-score/helm lint + tf fmt/validate/tfsec"
+        with:
+          fetch-depth: 0
 
-  # 14) Summary — always runs, collects artifacts (non-blocking)
+      # ---------- K8s tools: helm + kubeconform (install binaries) ----------
+      - name: Setup Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.4
+
+      - name: Install kubeconform
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="0.6.5"
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v${ver}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+          kubeconform -v
+
+      # Optional, non-blocking: kube-score for extra advice
+      - name: Install kube-score (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="1.17.0"
+          curl -sSL -o /usr/local/bin/kube-score "https://github.com/zegl/kube-score/releases/download/v${ver}/kube-score_ubuntu_amd64"
+          chmod +x /usr/local/bin/kube-score
+          kube-score version || true
+
+      # ---------- Validate raw K8s manifests (k8s/**) ----------
+      - name: K8s · kubeconform validate manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t files < <(git ls-files 'k8s/**/*.yaml' 'k8s/**/*.yml' 'infra/k8s/**/*.yaml' 'infra/k8s/**/*.yml')
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No raw K8s manifests found — skipping."
+            exit 0
+          fi
+          kubeconform -strict -ignore-missing-schemas -summary "${files[@]}"
+
+      - name: K8s · kube-score advise (non-blocking)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t files < <(git ls-files 'k8s/**/*.yaml' 'k8s/**/*.yml' 'infra/k8s/**/*.yaml' 'infra/k8s/**/*.yml')
+          if [ ${#files[@]} -eq 0 ]; then
+            exit 0
+          fi
+          kube-score score "${files[@]}" --output-format ci > __infra_kubescore.txt || true
+
+      # ---------- Helm charts: lint + render -> kubeconform ----------
+      - name: Helm · lint each chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mapfile -t charts < <(git ls-files 'helm/*/Chart.yaml' 'infra/helm/*/Chart.yaml' | xargs -n1 dirname | sort -u)
+          if [ ${#charts[@]} -eq 0 ]; then
+            echo "No Helm charts found — skipping."
+            exit 0
+          fi
+
+          for c in "${charts[@]}"; do
+            echo "::group::helm lint $c"
+            helm dependency build "$c" || true
+            helm lint "$c" --strict
+            # Render and validate with kubeconform
+            helm template "ci-$RANDOM" "$c" \
+              | kubeconform -strict -ignore-missing-schemas -summary -
+            echo "::endgroup::"
+          done
+
+      # ---------- Terraform: fmt/validate + tfsec (warning-only) ----------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform · fmt/validate per module
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Find terraform roots (dirs containing at least one *.tf)
+          mapfile -t tfroots < <(git ls-files '**/*.tf' | awk -F/ '{ $0 = (NF>1 ? substr($0,1,length($0)-length($NF)-1) : "."); print }' | sort -u)
+          if [ ${#tfroots[@]} -eq 0 ]; then
+            echo "No Terraform files found — skipping."
+            exit 0
+          fi
+
+          for d in "${tfroots[@]}"; do
+            echo "::group::terraform validate in $d"
+            pushd "$d" >/dev/null
+
+            terraform fmt -check -recursive
+            terraform init -backend=false -input=false
+            terraform validate -no-color
+
+            popd >/dev/null
+            echo "::endgroup::"
+          done
+
+      - name: Install tfsec
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install.sh | bash -s -- -b /usr/local/bin latest
+          tfsec --version
+
+      - name: tfsec scan (warning-only)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p __infra_tfsec
+
+          mapfile -t tfroots < <(git ls-files '**/*.tf' | awk -F/ '{ $0 = (NF>1 ? substr($0,1,length($0)-length($NF)-1) : "."); print }' | sort -u)
+          if [ ${#tfroots[@]} -eq 0 ]; then
+            exit 0
+          fi
+
+          for d in "${tfroots[@]}"; do
+            safe="$(echo "$d" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            echo "::group::tfsec $d"
+            tfsec "$d" --no-color --verbose > "__infra_tfsec/${safe}.log" 2>&1 || true
+            echo "::endgroup::"
+          done
+
+      - name: Upload infra lint artifacts
+        if: ${{ hashFiles('__infra_*') != '' || hashFiles('__infra_tfsec/**') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: infra-lint-artifacts
+          path: |
+            __infra_kubescore.txt
+            __infra_tfsec/**
+          retention-days: 7
+
+  # 14) Summary — always runs, non-blocking recap + artifact list
   summary:
     name: Summary · artifacts & recap
     needs:
@@ -311,7 +1914,62 @@ jobs:
       - infra-lint
     if: ${{ always() }}
     runs-on: ubuntu-latest
+
+    # Read access to list artifacts via Actions API
+    permissions:
+      contents: read
+      actions: read
+
     steps:
-      - run: |
-          echo "TODO: gather artifacts if exist (coverage, dist, logs)"
-          echo "This job always runs and is safe to make required alongside Meta."
+      - name: Generate run summary
+        uses: actions/github-script@v7
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        with:
+          script: |
+            const needs = JSON.parse(process.env.NEEDS_JSON || '{}');
+            const order = [
+              'meta','go-lint','go-test','go-build','docker-build',
+              'web-lint','web-test','web-build','contracts','integration',
+              'e2e','security','infra-lint'
+            ];
+            const header = [{data:'Job', header:true}, {data:'Result', header:true}];
+            const rows = [];
+            let ok=0, skipped=0, failed=0, cancelled=0;
+            for (const name of order) {
+              const n = needs[name];
+              if (!n) continue;
+              const res = (n.result || n.outcome || 'unknown').toLowerCase();
+              let emoji = '🟦';
+              if (res === 'success') { emoji='🟢'; ok++; }
+              else if (res === 'skipped') { emoji='⚪'; skipped++; }
+              else if (res === 'failure') { emoji='🔴'; failed++; }
+              else if (res === 'cancelled') { emoji='🟠'; cancelled++; }
+              rows.push([{data:name, header:false}, `${emoji} ${res}`]);
+            }
+            await core.summary
+              .addHeading('CI recap')
+              .addTable([header, ...rows])
+              .addSeparator()
+              .addRaw(`**Totals:** ✅ ${ok} • ⏭️ ${skipped} • ❌ ${failed} • 🟠 ${cancelled}`)
+              .write();
+
+      - name: List artifacts uploaded in this run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const {data} = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: context.runId, per_page: 100
+            });
+            const arts = data.artifacts || [];
+            const items = arts.map(a => `• ${a.name} (${a.size_in_bytes} bytes)`);
+            if (items.length === 0) {
+              await core.summary.addHeading('Artifacts').addRaw('_None_').write();
+            } else {
+              await core.summary.addHeading('Artifacts').addList(items).write();
+            }
+
+      - name: Final note
+        run: |
+          echo "Summary generated. This job is safe to mark as required together with Meta."
