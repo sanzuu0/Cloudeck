@@ -633,9 +633,6 @@ jobs:
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
     runs-on: ubuntu-latest
 
-    env:
-      NODE_VERSION: ${{ env.NODE_VERSION }}
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -770,9 +767,6 @@ jobs:
     needs: [ web-lint, changes ]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.frontend_exists == 'true' }}
     runs-on: ubuntu-latest
-
-    env:
-      NODE_VERSION: ${{ env.NODE_VERSION }}
 
     steps:
       - uses: actions/checkout@v4
@@ -934,8 +928,6 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      NODE_VERSION: ${{ env.NODE_VERSION }}
-      # Prevent Node OOM on larger builds (safe default)
       NODE_OPTIONS: --max_old_space_size=4096
 
     steps:
@@ -1097,7 +1089,6 @@ jobs:
       contents: read
 
     env:
-      NODE_VERSION: ${{ env.NODE_VERSION }}
       BASE_REF: ${{ github.base_ref || 'main' }}
 
     steps:
@@ -1260,7 +1251,7 @@ jobs:
     env:
       GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
       GOCACHE:    ${{ github.workspace }}/.cache/go/build
-      GO_VERSION: ${{ env.GO_VERSION }}
+      
       # Common integration envs your tests can read (override in repo if needed)
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/app?sslmode=disable
       REDIS_ADDR:   127.0.0.1:6379
@@ -1429,7 +1420,6 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      NODE_VERSION: ${{ env.NODE_VERSION }}
       # This folder will collect per-app artifacts
       E2E_ART_DIR: __e2e
 
@@ -1617,10 +1607,6 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' }}
     runs-on: ubuntu-latest
-
-    env:
-      GO_VERSION: ${{ env.GO_VERSION }}
-      NODE_VERSION: ${{ env.NODE_VERSION }}
 
     steps:
       - uses: actions/checkout@v4
