@@ -748,7 +748,7 @@ jobs:
               has_ts=true
             fi
 
-            # Detect ESLint config types (без 'ls', чтобы nullglob не ломал логику)
+            # Detect ESLint config types (flat vs legacy)
             has_flat_js=false
             for f in eslint.config.js eslint.config.cjs eslint.config.mjs; do
               if [ -f "$f" ]; then has_flat_js=true; break; fi
@@ -774,17 +774,24 @@ jobs:
               fi
             fi
 
-            # TypeScript type-check
+            # TypeScript type-check (skip if в пакете нет TS-файлов)
             if $has_ts; then
               echo "Running TypeScript type-check…"
-              if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
-                case "$pm" in
-                  pnpm) pnpm run -s typecheck ;;
-                  yarn) yarn -s run typecheck ;;
-                  npm)  npm run -s typecheck ;;
-                esac
+              ts_count=$(find . -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.d.ts' \) \
+                -not -path './node_modules/*' -not -path './dist/*' -not -path './build/*' -not -path './.next/*' -not -path './coverage/*' \
+                | wc -l | tr -d ' ')
+              if [ "$ts_count" -eq 0 ]; then
+                echo "Skip TS check (no .ts/.tsx files in $r)."
               else
-                exec_cmd tsc --noEmit
+                if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
+                  case "$pm" in
+                    pnpm) pnpm run -s typecheck ;;
+                    yarn) yarn -s run typecheck ;;
+                    npm)  npm run -s typecheck ;;
+                  esac
+                else
+                  exec_cmd tsc --noEmit
+                fi
               fi
             else
               echo "Skip TS check (no tsconfig/dependency)."
@@ -793,8 +800,7 @@ jobs:
             popd >/dev/null
             echo "::endgroup::"
           done
-
-
+  
   # 7) Web / Test — run unit tests per frontend app and collect coverage
   web-test:
     name: Web · Test
