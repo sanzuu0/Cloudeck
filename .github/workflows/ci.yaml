@@ -729,7 +729,7 @@ jobs:
                 ;;
             esac
 
-            # Helpers to exec local binaries
+            # Helper to exec local binaries
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
@@ -738,7 +738,7 @@ jobs:
               esac
             }
 
-            # Detect ESLint & TypeScript presence
+            # Detect ESLint & TS presence
             has_eslint=false
             has_ts=false
             if [ -f ".eslintrc" ] || ls .eslintrc.* >/dev/null 2>&1 || grep -q '"eslint"' package.json; then
@@ -748,12 +748,25 @@ jobs:
               has_ts=true
             fi
 
+            # Detect ESLint config type (Flat v9 vs Legacy v8)
+            has_flat=false
+            has_legacy=false
+            ls eslint.config.* >/dev/null 2>&1 && has_flat=true
+            [ -f ".eslintrc" ] || ls .eslintrc.* >/dev/null 2>&1 && has_legacy=true
+
             # ESLint (fail on warnings)
-            if $has_eslint; then
-              echo "Running ESLint…"
+            if $has_flat; then
+              echo "Running ESLint (flat config)…"
               exec_cmd eslint . --max-warnings=0
+            elif $has_legacy; then
+              echo "Running ESLint v8 for legacy .eslintrc…"
+              npx --yes eslint@8 . --max-warnings=0
             else
-              echo "Skip ESLint (no config/dependency)."
+              if $has_eslint; then
+                echo "ESLint dependency found but no config — skipping."
+              else
+                echo "Skip ESLint (no config/dependency)."
+              fi
             fi
 
             # TypeScript type-check
@@ -775,6 +788,7 @@ jobs:
             popd >/dev/null
             echo "::endgroup::"
           done
+  
 
   # 7) Web / Test — run unit tests per frontend app and collect coverage
   web-test:
