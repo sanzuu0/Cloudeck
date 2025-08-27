@@ -190,8 +190,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ver="1.6.26"     # можно "latest" или зафиксировать нужную версию
           curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
-            | bash -s -- -b . v1.6.26
+            | bash -s -- "$ver" .
+          ./actionlint -version
       - name: Run actionlint
         run: ./actionlint -color
 
@@ -687,11 +689,16 @@ jobs:
             echo "::group::Frontend checks in $r"
             pushd "$r" >/dev/null
 
-            # Detect package manager
-            pm="npm"
-            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
-            elif [ -f "yarn.lock" ];     then pm="yarn"
-            elif [ -f "package-lock.json" ]; then pm="npm"
+            # Detect package manager (lockfiles or packageManager field)
+            pm=""
+            if [ -f "pnpm-lock.yaml" ] || jq -e '.packageManager|test("^pnpm@")' package.json >/dev/null 2>&1; then
+              pm="pnpm"
+            elif [ -f "yarn.lock" ] || jq -e '.packageManager|test("^yarn@")' package.json >/dev/null 2>&1; then
+              pm="yarn"
+            elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ] || jq -e '.packageManager|test("^npm@")' package.json >/dev/null 2>&1; then
+              pm="npm"
+            else
+              pm="npm"
             fi
             echo "Package manager: $pm"
 
@@ -709,7 +716,11 @@ jobs:
                 fi
                 ;;
               npm)
-                npm ci
+                if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                  npm ci
+                else
+                  npm install --no-audit --no-fund
+                fi
                 ;;
             esac
 
@@ -717,7 +728,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) yarn -s run "$@" ;;
+                yarn) npx --yes "$@" ;;   # <= changed: use npx instead of `yarn run`
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -743,7 +754,6 @@ jobs:
             # TypeScript type-check
             if $has_ts; then
               echo "Running TypeScript type-check…"
-              # Prefer script if present, else call tsc directly
               if jq -e '.scripts.typecheck' package.json >/dev/null 2>&1; then
                 case "$pm" in
                   pnpm) pnpm run -s typecheck ;;
@@ -810,7 +820,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          mkdir -p "__coverage"
+          root="$(pwd -P)"
+          mkdir -p "$root/__coverage"
 
           # Discover frontend roots
           mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
@@ -825,10 +836,15 @@ jobs:
             pushd "$r" >/dev/null
 
             # Detect package manager
-            pm="npm"
-            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
-            elif [ -f "yarn.lock" ];     then pm="yarn"
-            elif [ -f "package-lock.json" ]; then pm="npm"
+            pm=""
+            if [ -f "pnpm-lock.yaml" ] || jq -e '.packageManager|test("^pnpm@")' package.json >/dev/null 2>&1; then
+              pm="pnpm"
+            elif [ -f "yarn.lock" ] || jq -e '.packageManager|test("^yarn@")' package.json >/dev/null 2>&1; then
+              pm="yarn"
+            elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ] || jq -e '.packageManager|test("^npm@")' package.json >/dev/null 2>&1; then
+              pm="npm"
+            else
+              pm="npm"
             fi
             echo "Package manager: $pm"
 
@@ -846,7 +862,11 @@ jobs:
                 fi
                 ;;
               npm)
-                npm ci
+                if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                  npm ci
+                else
+                  npm install --no-audit --no-fund
+                fi
                 ;;
             esac
 
@@ -854,7 +874,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) yarn -s run "$@" ;;
+                yarn) npx --yes "$@" ;;   # <= use npx instead of `yarn run`
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -898,9 +918,9 @@ jobs:
               echo "No test framework or script detected — skipping tests for $r."
             fi
 
-            # Collect coverage if produced
+            # Collect coverage if produced (absolute path)
             if [ -d "coverage" ] || [ -f "coverage/lcov.info" ]; then
-              dest="../../__coverage/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+              dest="$root/__coverage/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
               mkdir -p "$dest"
               cp -R coverage/* "$dest/" 2>/dev/null || true
               echo "Coverage collected to $dest"
@@ -972,7 +992,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          mkdir -p "__dist"
+          root="$(pwd -P)"
+          mkdir -p "$root/__dist"
 
           # Discover frontend roots
           mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
@@ -987,10 +1008,15 @@ jobs:
             pushd "$r" >/dev/null
 
             # Detect package manager
-            pm="npm"
-            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
-            elif [ -f "yarn.lock" ];     then pm="yarn"
-            elif [ -f "package-lock.json" ]; then pm="npm"
+            pm=""
+            if [ -f "pnpm-lock.yaml" ] || jq -e '.packageManager|test("^pnpm@")' package.json >/dev/null 2>&1; then
+              pm="pnpm"
+            elif [ -f "yarn.lock" ] || jq -e '.packageManager|test("^yarn@")' package.json >/dev/null 2>&1; then
+              pm="yarn"
+            elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ] || jq -e '.packageManager|test("^npm@")' package.json >/dev/null 2>&1; then
+              pm="npm"
+            else
+              pm="npm"
             fi
             echo "Package manager: $pm"
 
@@ -1008,7 +1034,11 @@ jobs:
                 fi
                 ;;
               npm)
-                npm ci
+                if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                  npm ci
+                else
+                  npm install --no-audit --no-fund
+                fi
                 ;;
             esac
 
@@ -1016,7 +1046,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) yarn -s run "$@" ;;
+                yarn) npx --yes "$@" ;;   # <= use npx
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -1035,7 +1065,6 @@ jobs:
                 exec_cmd vite build
               elif jq -e '.dependencies.next // .devDependencies.next' package.json >/dev/null 2>&1; then
                 exec_cmd next build || true
-                # export static if configured
                 if jq -e '.scripts.export' package.json >/dev/null 2>&1; then
                   case "$pm" in
                     pnpm) pnpm run -s export ;;
@@ -1050,8 +1079,8 @@ jobs:
               fi
             fi
 
-            # Collect artifacts from common output dirs
-            out_base="../__dist/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            # Collect artifacts (absolute path)
+            out_base="$root/__dist/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
             mkdir -p "$out_base"
             copied=false
             for d in dist build .next out public/build; do
@@ -1069,6 +1098,7 @@ jobs:
             popd >/dev/null
             echo "::endgroup::"
           done
+
 
       - name: Upload web dist artifacts
         if: ${{ hashFiles('__dist/**') != '' }}
@@ -1251,7 +1281,7 @@ jobs:
     env:
       GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
       GOCACHE:    ${{ github.workspace }}/.cache/go/build
-      
+
       # Common integration envs your tests can read (override in repo if needed)
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/app?sslmode=disable
       REDIS_ADDR:   127.0.0.1:6379
@@ -1467,7 +1497,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          mkdir -p "$E2E_ART_DIR"
+          root="$(pwd -P)"
+          mkdir -p "$root/$E2E_ART_DIR"
 
           # Discover frontend roots (root, apps/*, web/)
           mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
@@ -1482,10 +1513,15 @@ jobs:
             pushd "$r" >/dev/null
 
             # Detect package manager
-            pm="npm"
-            if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
-            elif [ -f "yarn.lock" ];     then pm="yarn"
-            elif [ -f "package-lock.json" ]; then pm="npm"
+            pm=""
+            if [ -f "pnpm-lock.yaml" ] || jq -e '.packageManager|test("^pnpm@")' package.json >/dev/null 2>&1; then
+              pm="pnpm"
+            elif [ -f "yarn.lock" ] || jq -e '.packageManager|test("^yarn@")' package.json >/dev/null 2>&1; then
+              pm="yarn"
+            elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ] || jq -e '.packageManager|test("^npm@")' package.json >/dev/null 2>&1; then
+              pm="npm"
+            else
+              pm="npm"
             fi
             echo "Package manager: $pm"
 
@@ -1503,7 +1539,11 @@ jobs:
                 fi
                 ;;
               npm)
-                npm ci
+                if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                  npm ci
+                else
+                  npm install --no-audit --no-fund
+                fi
                 ;;
             esac
 
@@ -1511,7 +1551,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) yarn -s run "$@" ;;
+                yarn) npx --yes "$@" ;;   # <= use npx
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -1539,8 +1579,8 @@ jobs:
                 pw_status=0
               fi
 
-              # Collect typical Playwright artifacts
-              dest="../$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/playwright"
+              # Collect Playwright artifacts (absolute path)
+              dest="$root/$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/playwright"
               mkdir -p "$dest"
               for d in playwright-report test-results blob-report; do
                 if [ -d "$d" ]; then
@@ -1560,15 +1600,14 @@ jobs:
             if $has_cypress; then
               echo "Cypress detected — verifying and running tests…"
               exec_cmd cypress verify || true
-              # Default headless run (Electron/Chrome depending on project)
               if ! exec_cmd cypress run --headless; then
                 cy_status=$?
               else
                 cy_status=0
               fi
 
-              # Collect typical Cypress artifacts
-              dest="../$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/cypress"
+              # Collect Cypress artifacts (absolute path)
+              dest="$root/$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/cypress"
               mkdir -p "$dest"
               for d in cypress/videos cypress/screenshots cypress/results; do
                 if [ -d "$d" ]; then
@@ -1665,7 +1704,10 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
-          mkdir -p "__sec/web"
+          root="$(pwd -P)"
+          mkdir -p "$root/__sec/web"
+  
+
           mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
                                 | xargs -n1 dirname | sort -u)
           if [ ${#roots[@]} -eq 0 ]; then
@@ -1680,28 +1722,46 @@ jobs:
             pm="npm"
             if   [ -f "pnpm-lock.yaml" ]; then pm="pnpm"
             elif [ -f "yarn.lock" ];     then pm="yarn"
-            elif [ -f "package-lock.json" ]; then pm="npm"
+            elif [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then pm="npm"
             fi
             echo "PM: $pm"
 
             status=0
+            note="ok"
+
             case "$pm" in
               pnpm)
-                pnpm audit || status=$?
+                if [ -f "pnpm-lock.yaml" ]; then
+                  pnpm audit || status=$?
+                else
+                  note="skipped: no pnpm-lock.yaml"
+                fi
                 ;;
               yarn)
-                (yarn npm audit --all --environment production || yarn npm audit --all) || status=$?
+                if [ -f "yarn.lock" ]; then
+                  (yarn npm audit --all --environment production || yarn npm audit --all) || status=$?
+                else
+                  note="skipped: no yarn.lock"
+                fi
                 ;;
               npm)
-                npm audit --audit-level=high || status=$?
+                if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ]; then
+                  npm audit --audit-level=high || status=$?
+                else
+                  note="skipped: no npm lockfile"
+                fi
                 ;;
             esac
 
-            echo "pm=$pm exit=$status" > "../__sec/web/audit-$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g').txt"
+            safe="$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            echo "pm=$pm status=$status note=$note" > "$root/__sec/web/audit-${safe}.txt"
+
             popd >/dev/null
             echo "::endgroup::"
           done
-          # warning-only: never fail here
+
+          # warning-only: шаг сам по себе не фейлит job
+          exit 0
 
       # ---------- Trivy: file-system scan (CRITICAL,HIGH; warning-only) ----------
       - name: Trivy FS scan (CRITICAL,HIGH)
