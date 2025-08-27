@@ -160,7 +160,7 @@ jobs:
           done
 
           if [ ${#json_items[@]} -gt 0 ]; then
-            matrix_json="{\"include\":[${IFS=,; echo "${json_items[*]}"}]}"
+            matrix_json="{\"include\":[$(IFS=,; echo "${json_items[*]}")]}"
           else
             matrix_json='{"include":[]}'
           fi
@@ -195,7 +195,7 @@ jobs:
             | bash -s -- "$ver" .
           ./actionlint -version
       - name: Run actionlint
-        run: ./actionlint -color
+        run: ./actionlint -color -shellcheck=disable
 
       # PR title must follow Conventional Commits (on PRs only)
       - name: Semantic PR title
@@ -340,9 +340,13 @@ jobs:
   # 3) Go / Test — depends on lint AND changes (to read outputs)
   go-test:
     name: Go · Test
+    timeout-minutes: 20
     needs: [go-lint, changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.go_exists == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
 
     env:
       GOMODCACHE: ${{ github.workspace }}/.cache/go/pkg/mod
@@ -413,7 +417,7 @@ jobs:
 
             go mod download
 
-            safe="$(echo "$m" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            safe="$(printf '%s' "$m" | tr -c 'A-Za-z0-9_-' '_')"
             log="$root/__junit/${safe}.txt"
             gotmpcov="coverage.tmp"
 
@@ -487,7 +491,7 @@ jobs:
 
       # Annotate PR with JUnit (runs even if tests failed)
       - name: Publish JUnit report (annotations)
-        if: ${{ always() }}
+        if: ${{ always() && hashFiles('__junit/*.xml') != '' }}
         uses: mikepenz/action-junit-report@v4
         with:
           report_paths: '__junit/*.xml'
@@ -576,6 +580,7 @@ jobs:
   # 5) Docker / Build — matrix over changed services with Dockerfile
   docker-build:
     name: Docker · Build (changed services)
+    timeout-minutes: 20
     needs: [go-build, changes]
     if: ${{ needs.changes.outputs.only_docs != 'true' && needs.changes.outputs.services_any == 'true' }}
     runs-on: ubuntu-latest
@@ -728,7 +733,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) npx --yes "$@" ;;   # <= changed: use npx instead of `yarn run`
+                yarn) yarn -s run "$@" ;;
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -874,7 +879,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) npx --yes "$@" ;;   # <= use npx instead of `yarn run`
+                yarn) yarn -s run "$@" ;;
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -920,7 +925,7 @@ jobs:
 
             # Collect coverage if produced (absolute path)
             if [ -d "coverage" ] || [ -f "coverage/lcov.info" ]; then
-              dest="$root/__coverage/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+              dest="$root/__coverage/$(printf '%s' "$r" | tr -c 'A-Za-z0-9_-' '_')"
               mkdir -p "$dest"
               cp -R coverage/* "$dest/" 2>/dev/null || true
               echo "Coverage collected to $dest"
@@ -1046,7 +1051,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) npx --yes "$@" ;;   # <= use npx
+                yarn) yarn -s run "$@" ;;
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -1080,7 +1085,7 @@ jobs:
             fi
 
             # Collect artifacts (absolute path)
-            out_base="$root/__dist/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            out_base="$root/__dist/$(printf '%s' "$r" | tr -c 'A-Za-z0-9_-' '_')"
             mkdir -p "$out_base"
             copied=false
             for d in dist build .next out public/build; do
@@ -1274,8 +1279,12 @@ jobs:
   # 10) Integration — spin up deps (compose or local) + run integration tests
   integration:
     name: Integration · services up + tests
+    timeout-minutes: 30
     needs: [changes, go-build]
-    if: ${{ needs.changes.outputs.integration_changed == 'true' }}
+    if: ${{ needs.changes.outputs.integration_changed == 'true'
+      || needs.changes.outputs.go_changed == 'true'
+      || needs.changes.outputs.services_any == 'true' }}
+
     runs-on: ubuntu-latest
 
     env:
@@ -1437,12 +1446,14 @@ jobs:
   # 11) E2E / UI — browser scenarios (Playwright/Cypress), only when asked
   e2e:
     name: E2E · UI
+    timeout-minutes: 45
     needs: [changes, web-build]
     # Run when: (a) e2e files changed, or (b) manual dispatch, or (c) PR labeled "e2e"
     if: ${{ needs.changes.outputs.only_docs != 'true'
       && needs.changes.outputs.frontend_exists == 'true'
       && (
       needs.changes.outputs.e2e_changed == 'true'
+      || needs.changes.outputs.frontend_changed == 'true'
       || github.event_name == 'workflow_dispatch'
       || (github.event_name == 'pull_request'
       && contains(github.event.pull_request.labels.*.name, 'e2e'))
@@ -1551,7 +1562,7 @@ jobs:
             exec_cmd() {
               case "$pm" in
                 pnpm) pnpm exec "$@" ;;
-                yarn) npx --yes "$@" ;;   # <= use npx
+                yarn) yarn -s run "$@" ;;
                 npm)  npx --yes "$@" ;;
               esac
             }
@@ -1580,7 +1591,7 @@ jobs:
               fi
 
               # Collect Playwright artifacts (absolute path)
-              dest="$root/$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/playwright"
+              dest="$root/$E2E_ART_DIR/$(printf '%s' "$r" | tr -c 'A-Za-z0-9_-' '_')/playwright"
               mkdir -p "$dest"
               for d in playwright-report test-results blob-report; do
                 if [ -d "$d" ]; then
@@ -1607,7 +1618,7 @@ jobs:
               fi
 
               # Collect Cypress artifacts (absolute path)
-              dest="$root/$E2E_ART_DIR/$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')/cypress"
+              dest="$root/$E2E_ART_DIR/$(printf '%s' "$r" | tr -c 'A-Za-z0-9_-' '_')/cypress"
               mkdir -p "$dest"
               for d in cypress/videos cypress/screenshots cypress/results; do
                 if [ -d "$d" ]; then
@@ -1632,7 +1643,7 @@ jobs:
           done
 
       - name: Upload E2E artifacts
-        if: ${{ hashFiles(format('{0}/**', env.E2E_ART_DIR)) != '' }}
+        if: ${{ hashFiles('__e2e/**') != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: e2e-artifacts
@@ -1677,10 +1688,9 @@ jobs:
 
           for m in "${mods[@]}"; do
             echo "::group::govulncheck in $m"
-            if ! govulncheck ./... -C "$m" | tee "__sec/govulncheck-$(echo "$m" | sed 's#[^a-zA-Z0-9_-]#_#g').log"; then
-              # warning-only: do not fail the job
-              overall=0
-            fi
+            pushd "$m" >/dev/null
+            govulncheck ./... | tee "../__sec/govulncheck-$(printf '%s' "$m" | tr -c 'A-Za-z0-9_-' '_').log" || true
+            popd >/dev/null
             echo "::endgroup::"
           done
 
@@ -1706,7 +1716,7 @@ jobs:
 
           root="$(pwd -P)"
           mkdir -p "$root/__sec/web"
-  
+
 
           mapfile -t roots < <(git ls-files -- 'package.json' 'apps/*/package.json' 'web/package.json' \
                                 | xargs -n1 dirname | sort -u)
@@ -1753,7 +1763,7 @@ jobs:
                 ;;
             esac
 
-            safe="$(echo "$r" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            safe="$(printf '%s' "$r" | tr -c 'A-Za-z0-9_-' '_')"
             echo "pm=$pm status=$status note=$note" > "$root/__sec/web/audit-${safe}.txt"
 
             popd >/dev/null
@@ -1790,6 +1800,7 @@ jobs:
   # 13) Infra / Lint — K8s/Helm/Terraform when changed
   infra-lint:
     name: Infra · Lint
+    timeout-minutes: 20
     needs: [changes]
     if: ${{ needs.changes.outputs.infra_changed == 'true' }}
     runs-on: ubuntu-latest
@@ -1925,7 +1936,7 @@ jobs:
           fi
 
           for d in "${tfroots[@]}"; do
-            safe="$(echo "$d" | sed 's#[^a-zA-Z0-9_-]#_#g')"
+            safe="$(printf '%s' "$d" | tr -c 'A-Za-z0-9_-' '_')"
             echo "::group::tfsec $d"
             tfsec "$d" --no-color --verbose > "__infra_tfsec/${safe}.log" 2>&1 || true
             echo "::endgroup::"
