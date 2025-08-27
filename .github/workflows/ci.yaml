@@ -741,21 +741,26 @@ jobs:
             # Detect ESLint & TS presence
             has_eslint=false
             has_ts=false
-            if [ -f ".eslintrc" ] || ls .eslintrc.* >/dev/null 2>&1 || grep -q '"eslint"' package.json; then
+            if jq -e '.dependencies.eslint // .devDependencies.eslint' package.json >/dev/null 2>&1 || [ -x "./node_modules/.bin/eslint" ]; then
               has_eslint=true
             fi
-            if [ -f "tsconfig.json" ] || grep -q '"typescript"' package.json; then
+            if [ -f "tsconfig.json" ] || jq -e '.dependencies.typescript // .devDependencies.typescript' package.json >/dev/null 2>&1; then
               has_ts=true
             fi
 
-            # Detect ESLint config type (Flat v9 vs Legacy v8)
-            has_flat=false
+            # Detect ESLint config types (без 'ls', чтобы nullglob не ломал логику)
+            has_flat_js=false
+            for f in eslint.config.js eslint.config.cjs eslint.config.mjs; do
+              if [ -f "$f" ]; then has_flat_js=true; break; fi
+            done
+
             has_legacy=false
-            ls eslint.config.* >/dev/null 2>&1 && has_flat=true
-            [ -f ".eslintrc" ] || ls .eslintrc.* >/dev/null 2>&1 && has_legacy=true
+            for f in .eslintrc .eslintrc.json .eslintrc.js .eslintrc.cjs .eslintrc.yml .eslintrc.yaml; do
+              if [ -f "$f" ]; then has_legacy=true; break; fi
+            done
 
             # ESLint (fail on warnings)
-            if $has_flat; then
+            if $has_flat_js; then
               echo "Running ESLint (flat config)…"
               exec_cmd eslint . --max-warnings=0
             elif $has_legacy; then
